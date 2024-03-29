@@ -20,7 +20,7 @@ print(chi2.median(df = k) ,chi2.ppf(q = 0.95, df = k))
 
 # Графики
 
-k=5
+k=10
 x = np.linspace(0, chi2.ppf(q = 0.999, df = k), 100)
 #x= np.arange(0, chi2.ppf(q = 0.99, df = k), 1.0)
 f_x = chi2.pdf(x, df = k)                            # значение функции плотности в соответствующих точках

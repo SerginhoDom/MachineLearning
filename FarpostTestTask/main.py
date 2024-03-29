@@ -1,152 +1,89 @@
 import torch
+import os
 import torch.nn as nn
 import torch.optim as optim
-from torchtext.data import Field, BucketIterator, TabularDataset
-import spacy
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import BertTokenizer, BertForMaskedLM
+from error_correction import preprocess_text, correct_errors
+from collections import Counter
 
-# Загрузка предварительно обученного токенизатора SpaCy для английского языка
-spacy_en = spacy.load('en_core_web_sm')
+tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+model = BertForMaskedLM.from_pretrained('bert-base-multilingual-cased')
 
-# Функции токенизации для предобработки текста
-def tokenize_en(text):
-    return [tok.text for tok in spacy_en.tokenizer(text)]
+def tokenize_and_mask(text):
+    tokens = tokenizer.tokenize(text)
+    masked_tokens = tokens.copy()
+    for i, token in enumerate(tokens):
+        masked_tokens[i] = '[MASK]'
+        indexed_tokens = tokenizer.convert_tokens_to_ids(masked_tokens)
+        tokens_tensor = torch.tensor([indexed_tokens])
+    return tokens_tensor
 
-# Определение полей для исходного и целевого текста
-SRC = Field(tokenize=tokenize_en, init_token='<sos>', eos_token='<eos>', lower=True)
-TRG = Field(tokenize=tokenize_en, init_token='<sos>', eos_token='<eos>', lower=True)
+loss_fn = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-5)
 
-# Загрузка датасета
-train_data, valid_data, test_data = TabularDataset.splits(
-    path='your_dataset_path',
-    train='train.csv',
-    validation='valid.csv',
-    test='test.csv',
-    format='csv',
-    fields=[('src', SRC), ('trg', TRG)]
-)
-
-# Построение словаря
-SRC.build_vocab(train_data, min_freq=2)
-TRG.build_vocab(train_data, min_freq=2)
-
-# Определение архитектуры модели
-class Encoder(nn.Module):
-    def init(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
-        super().init()
-        self.embedding = nn.Embedding(input_dim, emb_dim)
-        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, src):
-        embedded = self.dropout(self.embedding(src))
-        outputs, (hidden, cell) = self.rnn(embedded)
-        return hidden, cell
-
-class Decoder(nn.Module):
-    def init(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
-        super().init()
-        self.embedding = nn.Embedding(output_dim, emb_dim)
-        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
-        self.fc_out = nn.Linear(hid_dim, output_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, input, hidden, cell):
-        input = input.unsqueeze(0)
-        embedded = self.dropout(self.embedding(input))
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
-        prediction = self.fc_out(output.squeeze(0))
-        return prediction, hidden, cell
-
-class Seq2Seq(nn.Module):
-    def init(self, encoder, decoder, device):
-        super().init()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.device = device
-
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        batch_size = trg.shape[1]
-        trg_len = trg.shape[0]
-        trg_vocab_size = self.decoder.output_dim
-
-        outputs = torch.zeros(trg_len, batch_size, trg_vocab_size).to(self.device)
-        hidden, cell = self.encoder(src)
-
-        input = trg[0, :]
-        for t in range(1, trg_len):
-            output, hidden, cell = self.decoder(input, hidden, cell)
-            outputs[t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            top1 = output.argmax(1)
-            input = trg[t] if teacher_force else top1
-
-        return outputs
-
-# Определение параметров и инициализация модели
-INPUT_DIM = len(SRC.vocab)
-OUTPUT_DIM = len(TRG.vocab)
-ENC_EMB_DIM = 256
-DEC_EMB_DIM = 256
-HID_DIM = 512
-N_LAYERS = 2
-ENC_DROPOUT = 0.5
-DEC_DROPOUT = 0.5
-
-enc = Encoder(INPUT_DIM, ENC_EMB_DIM, HID_DIM, N_LAYERS, ENC_DROPOUT)
-dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, N_LAYERS, DEC_DROPOUT)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = Seq2Seq(enc, dec, device).to(device)
-
-# Инициализация оптимизатора и функции потерь
-optimizer = optim.Adam(model.parameters())
-TRG_PAD_IDX = TRG.vocab.stoi[TRG.pad_token]
-criterion = nn.CrossEntropyLoss(ignore_index = TRG_PAD_IDX)
-
-# Обучение модели
-def train(model, iterator, optimizer, criterion, clip):
-    model.train()
-    epoch_loss = 0
-    for i, batch in enumerate(iterator):
-        src = batch.src
-        trg = batch.trg
-optimizer.zero_grad()
-        output = model(src, trg)
-        output_dim = output.shape[-1]
-        output = output[1:].view(-1, output_dim)
-        trg = trg[1:].view(-1)
-        loss = criterion(output, trg)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-        optimizer.step()
-        epoch_loss += loss.item()
-    return epoch_loss / len(iterator)
-
-# Проверка производительности модели на валидационном наборе данных
-def evaluate(model, iterator, criterion):
-    model.eval()
-    epoch_loss = 0
+def correct_text(input_text):
+    tokens_tensor = tokenize_and_mask(input_text)
     with torch.no_grad():
-        for i, batch in enumerate(iterator):
-            src = batch.src
-            trg = batch.trg
-            output = model(src, trg, 0)
-            output_dim = output.shape[-1]
-            output = output[1:].view(-1, output_dim)
-            trg = trg[1:].view(-1)
-            loss = criterion(output, trg)
-            epoch_loss += loss.item()
-    return epoch_loss / len(iterator)
+        outputs = model(input_ids=tokens_tensor)
+        predictions = torch.argmax(outputs.logits, dim=-1)
+    corrected_text = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(predictions[0]))
+    return corrected_text
 
-# Обучение модели
-N_EPOCHS = 10
-CLIP = 1
-best_valid_loss = float('inf')
+input_text = "Это предложение с неправельным написанием 1."
+corrected_text = correct_text(input_text)
+print("Original Text:", input_text)
+print("Corrected Text:", corrected_text)
 
-for epoch in range(N_EPOCHS):
-    train_loss = train(model, train_iterator, optimizer, criterion, CLIP)
-    valid_loss = evaluate(model, valid_iterator, criterion)
-    if valid_loss < best_valid_loss:
-        best_valid_loss = valid_loss
-        torch.save(model.state_dict(), 'tut1-model.pt')
-    print(f'Epoch: {epoch+1:02} | Train Loss: {train_loss:.3f} | Val. Loss: {valid_loss:.3f}')
+
+def load_dataset_from_repo(repo_path):
+    dataset = []
+    for sentiment in ['positive', 'negative']:
+        sentiment_dir = os.path.join(repo_path, sentiment)
+        files = os.listdir(sentiment_dir)
+        for file in files:
+            with open(os.path.join(sentiment_dir, file), 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                dataset.extend(lines)
+    return dataset
+
+repo_path = 'https://github.com/dkulagin/kartaslov/raw/master/dataset'
+dataset = load_dataset_from_repo(repo_path)
+
+train_size = int(0.8 * len(dataset))
+train_dataset = dataset[:train_size]
+test_dataset = dataset[train_size:]
+
+word_freq = Counter()
+for text in train_dataset:
+    tokens = preprocess_text(text)
+    word_freq.update(tokens)
+
+def train_model(train_dataset, model, optimizer, loss_fn, num_epochs=10):
+    for epoch in range(num_epochs):
+        for text in train_dataset:
+            correct_text = preprocess_text(text)
+            corrected_text = correct_errors(correct_text, word_freq)
+            correct_tokens = tokenize_and_mask(correct_text)
+            incorrect_tokens = tokenize_and_mask(corrected_text)
+            optimizer.zero_grad()
+            outputs = model(input_ids=correct_tokens, labels=correct_tokens)
+            loss = loss_fn(outputs.logits.view(-1, tokenizer.vocab_size), correct_tokens.view(-1))
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item()}")
+
+train_model(train_dataset, model, optimizer, loss_fn)
+
+def correct_text(input_text):
+    tokens_tensor = tokenize_and_mask(input_text)
+    with torch.no_grad():
+        outputs = model(input_ids=tokens_tensor)
+        predictions = torch.argmax(outputs.logits, dim=-1)
+    corrected_text = tokenizer.convert_tokens_to_string(tokenizer.convert_ids_to_tokens(predictions[0]))
+    return corrected_text
+
+input_text = "Это предложение с неправельным написанием 1."
+corrected_text = correct_text(input_text)
+print("Original Text:", input_text)
+print("Corrected Text:", corrected_text)
